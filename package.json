@@ -12,9 +12,11 @@
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.10.0",
     "body-parser": "^2.2.0",
+    "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "ngrok": "^5.0.0-beta.2",
-    "puppeteer": "^24.11.0"
+    "puppeteer": "^24.11.0",
+    "twitter-api-v2": "^1.24.0"
   },
   "description": ""
 }

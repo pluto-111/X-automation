@@ -1,42 +1,224 @@
-// index.js - AI-Powered Twitter Automation System
+// Enhanced Twitter Automation with Auto-Posting
 const express = require("express");
 const bodyParser = require("body-parser");
 const puppeteer = require("puppeteer");
 const axios = require("axios");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { TwitterApi } = require('twitter-api-v2');
 
 const app = express();
 app.use(bodyParser.json());
 
-// 🔐 Configuration - Use environment variables in production
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyAig1QzEEACMImEcIAAHfTMYz4WKIpxs8k";
-const ZAP2_WEBHOOK_URL = process.env.ZAP2_WEBHOOK_URL || "https://hooks.zapier.com/hooks/catch/23556079/ubroa98/";
-const TARGET_PROFILE = process.env.TARGET_PROFILE || "sundarpichai";
+// 🔐 Configuration - Add Twitter API credentials
+const dotenv = require("dotenv");
+dotenv.config();
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY // "your_gemini_api_key";
+const ZAP2_WEBHOOK_URL = process.env.ZAP2_WEBHOOK_URL // "your_zapier_webhook_url";
+const TARGET_PROFILE = process.env.TARGET_PROFILE // "target_profile_name";
 
+// 🐦 Twitter API Configuration
+const TWITTER_CONFIG = {
+  appKey: process.env.TWITTER_API_KEY || 'your_twitter_api_key',
+  appSecret: process.env.TWITTER_API_SECRET || 'your_twitter_api_secret',
+  accessToken: process.env.TWITTER_ACCESS_TOKEN || 'your_access_token',
+  accessSecret: process.env.TWITTER_ACCESS_SECRET || 'your_access_secret',
+};
+
+// Initialize clients
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const twitterClient = new TwitterApi(TWITTER_CONFIG);
 
-// ✅ Home route with status information
+// 🛡️ Safety and control settings
+const POSTING_CONFIG = {
+  autoPostEnabled: process.env.AUTO_POST_ENABLED === 'true' || false,
+  requireApproval: process.env.REQUIRE_APPROVAL !== 'false', // Default to true
+  maxPostsPerHour: parseInt(process.env.MAX_POSTS_PER_HOUR) || 5,
+  minDelayBetweenPosts: parseInt(process.env.MIN_DELAY_SECONDS) || 60, // seconds
+  dryRun: process.env.DRY_RUN === 'true' || false
+};
+
+// 📊 In-memory tracking (use database in production)
+const postingStats = {
+  postsThisHour: 0,
+  lastPostTime: 0,
+  totalPosts: 0,
+  totalErrors: 0,
+  pendingApprovals: [],
+  recentPosts: []
+};
+
+// ✅ Enhanced home route with posting status
 app.get("/", (req, res) => {
   res.json({
-    status: "🚀 Twitter Automation Server Running",
+    status: "🚀 Twitter Automation Server with Auto-Posting",
+    postingEnabled: POSTING_CONFIG.autoPostEnabled,
+    requireApproval: POSTING_CONFIG.requireApproval,
+    dryRun: POSTING_CONFIG.dryRun,
+    stats: {
+      postsThisHour: postingStats.postsThisHour,
+      totalPosts: postingStats.totalPosts,
+      pendingApprovals: postingStats.pendingApprovals.length
+    },
     endpoints: {
       webhook: "/webhook - Main automation endpoint",
-      health: "/health - Server health check"
+      approve: "/approve/:id - Approve pending posts",
+      reject: "/reject/:id - Reject pending posts",
+      stats: "/stats - Posting statistics",
+      pending: "/pending - View pending approvals"
     },
     lastRun: new Date().toISOString()
   });
 });
 
-// 🏥 Health check endpoint
-app.get("/health", (req, res) => {
+// 📊 Stats endpoint
+app.get("/stats", (req, res) => {
   res.json({
-    status: "healthy",
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    ...postingStats,
+    config: POSTING_CONFIG,
+    hourlyRateLimit: {
+      current: postingStats.postsThisHour,
+      max: POSTING_CONFIG.maxPostsPerHour,
+      resetTime: new Date(Date.now() + (60 - new Date().getMinutes()) * 60000).toISOString()
+    }
   });
 });
 
-// ✨ Enhanced Gemini reply generation with better prompting
+// 📋 Pending approvals endpoint
+app.get("/pending", (req, res) => {
+  res.json({
+    count: postingStats.pendingApprovals.length,
+    pending: postingStats.pendingApprovals
+  });
+});
+
+// ✅ Approve pending post
+app.post("/approve/:id", async (req, res) => {
+  const { id } = req.params;
+  const pendingPost = postingStats.pendingApprovals.find(p => p.id === id);
+  
+  if (!pendingPost) {
+    return res.status(404).json({ error: "Pending post not found" });
+  }
+
+  try {
+    const result = await postReplyToTwitter(
+      pendingPost.originalTweetId,
+      pendingPost.replyText,
+      pendingPost.originalTweetURL
+    );
+
+    // Remove from pending and add to recent
+    postingStats.pendingApprovals = postingStats.pendingApprovals.filter(p => p.id !== id);
+    postingStats.recentPosts.unshift({
+      ...pendingPost,
+      postedAt: new Date().toISOString(),
+      twitterResponse: result,
+      status: 'approved_and_posted'
+    });
+
+    res.json({
+      message: "✅ Post approved and published",
+      tweetId: result.tweetId,
+      pendingPost
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to post after approval",
+      message: error.message
+    });
+  }
+});
+
+// ❌ Reject pending post
+app.post("/reject/:id", (req, res) => {
+  const { id } = req.params;
+  const pendingPost = postingStats.pendingApprovals.find(p => p.id === id);
+  
+  if (!pendingPost) {
+    return res.status(404).json({ error: "Pending post not found" });
+  }
+
+  postingStats.pendingApprovals = postingStats.pendingApprovals.filter(p => p.id !== id);
+  
+  res.json({
+    message: "❌ Post rejected and removed",
+    rejectedPost: pendingPost
+  });
+});
+
+// ⏰ Rate limiting check
+function canPostNow() {
+  const now = Date.now();
+  const oneHourAgo = now - (60 * 60 * 1000);
+  
+  // Reset hourly counter if needed
+  if (postingStats.lastPostTime < oneHourAgo) {
+    postingStats.postsThisHour = 0;
+  }
+  
+  // Check rate limits
+  if (postingStats.postsThisHour >= POSTING_CONFIG.maxPostsPerHour) {
+    return { canPost: false, reason: "Hourly rate limit exceeded" };
+  }
+  
+  if (now - postingStats.lastPostTime < POSTING_CONFIG.minDelayBetweenPosts * 1000) {
+    return { canPost: false, reason: "Too soon since last post" };
+  }
+  
+  return { canPost: true };
+}
+
+// 🐦 Extract Twitter ID from URL
+function extractTweetId(tweetUrl) {
+  if (!tweetUrl) return null;
+  
+  // Handle both nitter.net and x.com URLs
+  const match = tweetUrl.match(/\/status\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+// 🚀 Main Twitter posting function
+async function postReplyToTwitter(originalTweetId, replyText, originalUrl) {
+  if (POSTING_CONFIG.dryRun) {
+    console.log("🧪 DRY RUN - Would post:", { originalTweetId, replyText });
+    return {
+      success: true,
+      dryRun: true,
+      tweetId: 'dry_run_' + Date.now(),
+      originalTweetId,
+      replyText
+    };
+  }
+
+  try {
+    // Post reply to Twitter
+    const tweet = await twitterClient.v2.reply(replyText, originalTweetId);
+    
+    console.log("✅ Successfully posted reply to Twitter:", tweet.data.id);
+    
+    // Update stats
+    postingStats.totalPosts++;
+    postingStats.postsThisHour++;
+    postingStats.lastPostTime = Date.now();
+    
+    return {
+      success: true,
+      tweetId: tweet.data.id,
+      originalTweetId,
+      replyText,
+      postedAt: new Date().toISOString()
+    };
+    
+  } catch (error) {
+    console.error("❌ Failed to post to Twitter:", error.message);
+    postingStats.totalErrors++;
+    
+    throw new Error(`Twitter API Error: ${error.message}`);
+  }
+}
+
+// ✨ Enhanced Gemini reply generation (same as before)
 async function generateReply(tweetText, retries = 2) {
   const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
@@ -46,9 +228,10 @@ You are a thoughtful and engaging social media commenter. Generate a natural, co
 Guidelines:
 - Keep it conversational and authentic (1-2 sentences max)
 - Add value or insight, don't just agree
-- Use relevant emojis sparingly
+- Use relevant emojis sparingly (max 1-2)
 - Avoid controversial topics
 - Be supportive but not overly promotional
+- Make it feel human and genuine
 
 Tweet to reply to:
 "${tweetText}"
@@ -61,28 +244,26 @@ Reply:`;
       const response = await result.response;
       const text = response.text().trim();
       
-      // Basic quality check
       if (text.length > 10 && text.length < 280) {
         return text;
       }
       
       if (attempt === retries) {
-        return "🤖 Thanks for sharing this insight!";
+        return "Thanks for sharing this insight! 🤔";
       }
     } catch (err) {
       console.error(`❌ Gemini API attempt ${attempt + 1} failed:`, err.message);
       
       if (attempt === retries) {
-        return "🤖 Interesting perspective - thanks for sharing!";
+        return "Interesting perspective - thanks for sharing! 💭";
       }
       
-      // Wait before retry
       await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
     }
   }
 }
 
-// 🕸️ Enhanced scraping function with better error handling
+// 🕸️ Scraping function (same as before)
 async function scrapeNitterProfile(profileName, maxTweets = 2) {
   let browser;
   
@@ -99,23 +280,13 @@ async function scrapeNitterProfile(profileName, maxTweets = 2) {
     });
 
     const page = await browser.newPage();
-
-    // Enhanced browser simulation
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
     
     await page.setViewport({ width: 1366, height: 768 });
     
-    await page.setExtraHTTPHeaders({
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-    });
-
-    const nitterUrl = `https://nitter.net/${profileName}`;
+    const nitterUrl = `https://nitter.net/${TARGET_PROFILE}`;
     console.log(`🔍 Navigating to: ${nitterUrl}`);
 
     await page.goto(nitterUrl, {
@@ -123,10 +294,8 @@ async function scrapeNitterProfile(profileName, maxTweets = 2) {
       timeout: 30000
     });
 
-    // Wait for content to load
     await page.waitForSelector(".timeline-item", { timeout: 20000 });
 
-    // Scroll to load more content
     await page.evaluate(async () => {
       for (let i = 0; i < 3; i++) {
         window.scrollBy(0, window.innerHeight);
@@ -134,7 +303,6 @@ async function scrapeNitterProfile(profileName, maxTweets = 2) {
       }
     });
 
-    // Extract tweets with improved selector strategy
     const tweets = await page.$$eval(".timeline-item", (nodes, maxCount) => {
       return nodes.slice(0, maxCount).map((node, index) => {
         const contentElement = node.querySelector('.tweet-content');
@@ -143,19 +311,18 @@ async function scrapeNitterProfile(profileName, maxTweets = 2) {
         const content = contentElement ? contentElement.innerText.trim() : node.innerText.trim();
         const link = linkElement ? "https://nitter.net" + linkElement.getAttribute("href") : null;
         
-        // Extract additional metadata
         const username = node.querySelector('.username')?.innerText || profileName;
         const timestamp = node.querySelector('.tweet-date')?.getAttribute('title') || new Date().toISOString();
         
         return {
           index: index + 1,
-          content: content.substring(0, 500), // Limit content length
+          content: content.substring(0, 500),
           link,
           username,
           timestamp,
           wordCount: content.split(' ').length
         };
-      }).filter(tweet => tweet.content.length > 10); // Filter out very short/empty tweets
+      }).filter(tweet => tweet.content.length > 10);
     }, maxTweets);
 
     await browser.close();
@@ -171,7 +338,7 @@ async function scrapeNitterProfile(profileName, maxTweets = 2) {
   }
 }
 
-// 📤 Enhanced Zapier webhook sender with retry logic
+// 📤 Enhanced Zapier sender (same as before)
 async function sendToZapier(data, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -193,29 +360,27 @@ async function sendToZapier(data, retries = 3) {
         throw new Error(`Failed to send to Zapier after ${retries + 1} attempts`);
       }
       
-      // Exponential backoff
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
     }
   }
 }
 
-// 🚀 Main webhook endpoint with comprehensive error handling
+// 🚀 Enhanced main webhook with auto-posting
 app.post("/webhook", async (req, res) => {
   const startTime = Date.now();
   console.log("🎯 Webhook triggered at", new Date().toISOString());
-  console.log("📥 Request body:", req.body);
 
   try {
-    // Extract parameters from request body
     const {
       profile = TARGET_PROFILE,
       maxTweets = 2,
-      generateReplies = true
+      generateReplies = true,
+      autoPost = POSTING_CONFIG.autoPostEnabled
     } = req.body;
 
     console.log(`🔍 Starting scrape for profile: ${profile}`);
+    console.log(`🤖 Auto-posting: ${autoPost ? 'ENABLED' : 'DISABLED'}`);
 
-    // Step 1: Scrape tweets
     const tweets = await scrapeNitterProfile(profile, maxTweets);
 
     if (tweets.length === 0) {
@@ -228,28 +393,89 @@ app.post("/webhook", async (req, res) => {
 
     const replies = [];
 
-    // Step 2: Generate replies and send to Zapier
     for (const [index, tweet] of tweets.entries()) {
       console.log(`🤖 Processing tweet ${index + 1}/${tweets.length}`);
       
       let replyText = "No reply generated";
+      let postingResult = null;
+      let pendingApprovalId = null;
       
       if (generateReplies && tweet.content) {
         replyText = await generateReply(tweet.content);
         console.log(`💬 Generated reply: ${replyText.substring(0, 50)}...`);
       }
 
+      // Handle auto-posting logic
+      if (autoPost && replyText !== "No reply generated") {
+        const tweetId = extractTweetId(tweet.link);
+        
+        if (tweetId) {
+          const rateLimitCheck = canPostNow();
+          
+          if (rateLimitCheck.canPost) {
+            if (POSTING_CONFIG.requireApproval) {
+              // Add to pending approvals
+              pendingApprovalId = `approval_${Date.now()}_${index}`;
+              postingStats.pendingApprovals.push({
+                id: pendingApprovalId,
+                originalTweetId: tweetId,
+                originalTweetURL: tweet.link,
+                originalText: tweet.content,
+                replyText,
+                createdAt: new Date().toISOString(),
+                profile
+              });
+              
+              console.log(`⏳ Added to pending approvals: ${pendingApprovalId}`);
+              postingResult = { 
+                status: 'pending_approval', 
+                approvalId: pendingApprovalId,
+                approveUrl: `http://localhost:3000/approve/${pendingApprovalId}`
+              };
+              
+            } else {
+              // Auto-post immediately
+              try {
+                postingResult = await postReplyToTwitter(tweetId, replyText, tweet.link);
+                console.log(`🐦 Auto-posted reply: ${postingResult.tweetId}`);
+              } catch (postError) {
+                console.error(`❌ Auto-posting failed: ${postError.message}`);
+                postingResult = { 
+                  status: 'posting_failed', 
+                  error: postError.message 
+                };
+              }
+            }
+          } else {
+            console.log(`⏰ Rate limit check failed: ${rateLimitCheck.reason}`);
+            postingResult = { 
+              status: 'rate_limited', 
+              reason: rateLimitCheck.reason 
+            };
+          }
+        } else {
+          console.log(`❌ Could not extract tweet ID from: ${tweet.link}`);
+          postingResult = { 
+            status: 'invalid_tweet_id', 
+            url: tweet.link 
+          };
+        }
+      }
+
       const replyData = {
         profile,
         tweetIndex: index + 1,
         originalTweetURL: tweet.link,
+        originalTweetId: extractTweetId(tweet.link),
         originalText: tweet.content,
         originalUsername: tweet.username,
         originalTimestamp: tweet.timestamp,
         replyText,
         generatedAt: new Date().toISOString(),
         wordCount: tweet.wordCount,
-        processingTime: Date.now() - startTime
+        autoPostEnabled: autoPost,
+        postingResult,
+        pendingApprovalId
       };
 
       replies.push(replyData);
@@ -263,25 +489,31 @@ app.post("/webhook", async (req, res) => {
         replyData.zapierError = zapierError.message;
       }
 
-      // Add delay between requests to be respectful
       if (index < tweets.length - 1) {
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
 
     const processingTime = Date.now() - startTime;
+    const postedCount = replies.filter(r => r.postingResult?.status === 'posted' || r.postingResult?.success).length;
+    const pendingCount = replies.filter(r => r.postingResult?.status === 'pending_approval').length;
 
     res.status(200).json({
       message: "✅ Processing completed successfully",
       profile,
       tweetsProcessed: tweets.length,
-      repliesGenerated: replies.filter(r => !r.zapierError).length,
-      errors: replies.filter(r => r.zapierError).length,
+      repliesGenerated: replies.filter(r => r.replyText !== "No reply generated").length,
+      autoPostingEnabled: POSTING_CONFIG.autoPostEnabled,
+      posted: postedCount,
+      pendingApproval: pendingCount,
+      rateLimited: replies.filter(r => r.postingResult?.status === 'rate_limited').length,
+      errors: replies.filter(r => r.zapierError || r.postingResult?.status === 'posting_failed').length,
       processingTime: `${processingTime}ms`,
       replies: replies.map(r => ({
         url: r.originalTweetURL,
         reply: r.replyText.substring(0, 100) + (r.replyText.length > 100 ? '...' : ''),
-        success: !r.zapierError
+        postingStatus: r.postingResult?.status || 'not_attempted',
+        approvalUrl: r.pendingApprovalId ? `http://localhost:3000/approve/${r.pendingApprovalId}` : null
       }))
     });
 
@@ -297,46 +529,19 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// 🎛️ Manual test endpoint
-app.post("/test", async (req, res) => {
-  try {
-    const testTweet = "Exciting developments in AI technology are transforming how we work and live.";
-    const reply = await generateReply(testTweet);
-    
-    res.json({
-      status: "✅ Test completed",
-      originalTweet: testTweet,
-      generatedReply: reply,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: "Test failed",
-      message: error.message
-    });
-  }
-});
-
-// 🛡️ Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({
-    error: 'Something went wrong!',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// 🔊 Start server with enhanced logging
+// 🔊 Start server
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`🚀 Twitter Automation Server started`);
+  console.log(`🚀 Twitter Automation Server with Auto-Posting`);
   console.log(`📍 Server URL: http://localhost:${port}`);
   console.log(`🎯 Target Profile: ${TARGET_PROFILE}`);
-  console.log(`🔗 Zapier Webhook: ${ZAP2_WEBHOOK_URL ? 'Configured' : 'Not configured'}`);
+  console.log(`🐦 Auto-Posting: ${POSTING_CONFIG.autoPostEnabled ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`🛡️ Approval Required: ${POSTING_CONFIG.requireApproval ? 'YES' : 'NO'}`);
+  console.log(`🧪 Dry Run Mode: ${POSTING_CONFIG.dryRun ? 'ON' : 'OFF'}`);
+  console.log(`⏰ Rate Limit: ${POSTING_CONFIG.maxPostsPerHour} posts/hour`);
   console.log(`🕐 Started at: ${new Date().toISOString()}`);
 });
 
-// 🛑 Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('👋 SIGTERM received, shutting down gracefully');
   process.exit(0);
